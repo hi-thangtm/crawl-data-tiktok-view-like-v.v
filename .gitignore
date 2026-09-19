@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Local runtime data
+.DS_Store
+*.log
+exports/
+data/debug/
+data/*.json
+
+# Editor
+.vscode/
