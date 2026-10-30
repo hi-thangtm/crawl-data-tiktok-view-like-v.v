@@ -1,6 +1,7 @@
 import asyncio
 import sys
 
+import app.runtime_env  # noqa: F401 - Configure macOS bundled Playwright path
 from time import perf_counter
 
 from PySide6.QtCore import (
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -41,15 +43,33 @@ from app.collectors.tiktok_batch import (
     RETRYABLE_STATUSES,
 )
 
+from app.models import TikTokProfileResult
+
 from app.utils.url_parser import (
     parse_tiktok_url,
+    parse_tiktok_channel_input,
+    deduplicate_channel_inputs,
+    TikTokChannelInput,
+)
+
+from app.collectors.tiktok_profile_batch import (
+    TikTokProfileBatchCollector,
+    PROFILE_RETRYABLE_STATUSES,
+)
+
+
+from app.utils.profile_excel import (
+    export_profile_excel,
+    format_profile_status,
 )
 
 from run_batch import (
     deduplicate_urls,
     export_excel,
     status_label,
+    get_export_dir,
 )
+
 
 from app.session_manager import (
     SESSION_STATE_FILE,
@@ -333,8 +353,98 @@ class CollectorWorker(
 
 
 # ============================================================
+# PROFILE WORKER CHAY O THREAD RIENG
+# ============================================================
+
+class ProfileCollectorWorker(
+    QObject
+):
+
+    result_ready = Signal(
+        object,
+        bool,
+    )
+
+    finished = Signal(
+        object
+    )
+
+    failed = Signal(
+        str
+    )
+
+    def __init__(
+        self,
+        channels: list[TikTokChannelInput],
+    ):
+        super().__init__()
+        self.channels = channels
+        self.collector = None
+
+    def cancel(self):
+        if self.collector is not None:
+            self.collector.cancel()
+
+    def emit_result(
+        self,
+        result: TikTokProfileResult,
+        retry_mode: bool,
+    ):
+        self.result_ready.emit(
+            result.to_dict(),
+            retry_mode,
+        )
+
+    async def run_async(
+        self,
+    ):
+        self.collector = TikTokProfileBatchCollector(
+            concurrency=2,
+            retry_concurrency=1,
+            start_interval=0.5,
+            retry_start_interval=1.2,
+            cooldown_403=12.0,
+            retry_delay=5.0,
+            headless=True,
+            result_callback=self.emit_result,
+        )
+
+        start = perf_counter()
+
+        results = await self.collector.collect_many(
+            self.channels
+        )
+
+        elapsed = perf_counter() - start
+
+        return {
+            "results": results,
+            "elapsed": elapsed,
+        }
+
+    @Slot()
+    def run(
+        self,
+    ):
+        try:
+            payload = asyncio.run(
+                self.run_async()
+            )
+
+            self.finished.emit(
+                payload
+            )
+
+        except Exception as exc:
+            self.failed.emit(
+                f"{type(exc).__name__}: {exc}"
+            )
+
+
+# ============================================================
 # SESSION CHECK WORKER
 # ============================================================
+
 
 class SessionCheckWorker(
     QObject
@@ -810,6 +920,19 @@ class MainWindow(
 
         self.last_elapsed = 0
 
+        # Profile tab state
+        self.profile_thread = None
+        self.profile_worker = None
+        self.is_profile_running = False
+        self.profile_unique_items = []
+        self.profile_duplicate_urls = []
+        self.profile_original_count = 0
+        self.profile_row_by_key = {}
+        self.profile_latest_status = {}
+        self.profile_finalized_keys = set()
+        self.profile_last_results = []
+        self.profile_last_elapsed = 0
+
         # Chuyen session cu sang thu muc rieng cua user (chi 1 lan).
         migrate_legacy_session()
 
@@ -822,6 +945,9 @@ class MainWindow(
         self.start_session_check()
 
         self.update_input_counter()
+
+        self.update_profile_input_counter()
+
 
     # ========================================================
     # UI
@@ -917,10 +1043,47 @@ class MainWindow(
         )
 
         # ====================================================
+        # TABS
+        # ====================================================
+
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+
+        self.tab_videos = self.build_video_tab()
+        self.tabs.addTab(
+            self.tab_videos,
+            "Hiệu suất video",
+        )
+
+        self.tab_profiles = self.build_profile_tab()
+        self.tabs.addTab(
+            self.tab_profiles,
+            "Thông tin kênh TikTok",
+        )
+
+        main_layout.addWidget(
+            self.tabs,
+            1,
+        )
+
+    # ========================================================
+    # TAB 1: VIDEO PERFORMANCE (GIU NGUYEN 100%)
+    # ========================================================
+
+    def build_video_tab(
+        self,
+    ) -> QWidget:
+        tab_widget = QWidget()
+        layout = QVBoxLayout(tab_widget)
+        layout.setContentsMargins(10, 12, 10, 10)
+        layout.setSpacing(12)
+
+        # ====================================================
         # KPI
         # ====================================================
 
         cards = QHBoxLayout()
+
 
         cards.setSpacing(
             10
@@ -958,7 +1121,7 @@ class MainWindow(
             self.card_other
         )
 
-        main_layout.addLayout(
+        layout.addLayout(
             cards
         )
 
@@ -1283,10 +1446,225 @@ class MainWindow(
             ]
         )
 
-        main_layout.addWidget(
+        layout.addWidget(
             splitter,
             1,
         )
+
+        return tab_widget
+
+    # ========================================================
+    # TAB 2: PROFILE ANALYTICS (THÔNG TIN KÊNH TIKTOK)
+    # ========================================================
+
+    def build_profile_tab(
+        self,
+    ) -> QWidget:
+        tab_widget = QWidget()
+        layout = QVBoxLayout(tab_widget)
+        layout.setContentsMargins(10, 12, 10, 10)
+        layout.setSpacing(12)
+
+        # ====================================================
+        # KPI PROFILE
+        # ====================================================
+
+        cards = QHBoxLayout()
+        cards.setSpacing(10)
+
+        self.profile_card_input = StatCard(
+            "Kênh đã nhập"
+        )
+
+        self.profile_card_processed = StatCard(
+            "Đã xử lý"
+        )
+
+        self.profile_card_success = StatCard(
+            "Thành công"
+        )
+
+        self.profile_card_other = StatCard(
+            "Không lấy được"
+        )
+
+        cards.addWidget(self.profile_card_input)
+        cards.addWidget(self.profile_card_processed)
+        cards.addWidget(self.profile_card_success)
+        cards.addWidget(self.profile_card_other)
+
+        layout.addLayout(cards)
+
+        # ====================================================
+        # SPLITTER PROFILE
+        # ====================================================
+
+        splitter = QSplitter(Qt.Vertical)
+
+        # ====================================================
+        # INPUT AREA PROFILE
+        # ====================================================
+
+        input_frame = QFrame()
+        input_frame.setObjectName("panel")
+
+        input_layout = QVBoxLayout(input_frame)
+        input_layout.setContentsMargins(16, 14, 16, 14)
+
+        input_header = QHBoxLayout()
+
+        input_title = QLabel("Danh sách kênh / Creator TikTok")
+        input_title.setObjectName("sectionTitle")
+
+        self.profile_input_info = QLabel("0 kênh")
+        self.profile_input_info.setObjectName("inputInfo")
+
+        input_header.addWidget(input_title)
+        input_header.addStretch()
+        input_header.addWidget(self.profile_input_info)
+
+        input_layout.addLayout(input_header)
+
+        self.profile_url_input = QPlainTextEdit()
+        self.profile_url_input.setPlaceholderText(
+            "Nhập link kênh, @username hoặc link video (mỗi dòng 1 kênh)...\n\n"
+            "https://www.tiktok.com/@kimchungphan20\n"
+            "@kimchungphan20\n"
+            "kimchungphan20\n"
+            "https://www.tiktok.com/@kimchungphan20/video/7614484260753345812"
+        )
+        self.profile_url_input.setMinimumHeight(135)
+        self.profile_url_input.textChanged.connect(
+            self.update_profile_input_counter
+        )
+
+        input_layout.addWidget(self.profile_url_input)
+
+        # ====================================================
+        # BUTTONS PROFILE
+        # ====================================================
+
+        buttons = QHBoxLayout()
+
+        self.profile_paste_button = QPushButton("Dán từ Clipboard")
+        self.profile_clear_button = QPushButton("Xóa danh sách")
+
+        self.profile_open_dir_button = QPushButton("Mở thư mục")
+        self.profile_export_button = QPushButton("Xuất Excel")
+        self.profile_export_button.setEnabled(False)
+
+        self.profile_stop_button = QPushButton("Dừng")
+        self.profile_stop_button.setObjectName("stopButton")
+        self.profile_stop_button.setEnabled(False)
+
+        self.profile_start_button = QPushButton("BẮT ĐẦU QUÉT")
+        self.profile_start_button.setObjectName("primaryButton")
+
+        self.profile_paste_button.clicked.connect(self.paste_profile_clipboard)
+        self.profile_clear_button.clicked.connect(self.clear_profile_inputs)
+        self.profile_open_dir_button.clicked.connect(self.open_export_dir_clicked)
+        self.profile_export_button.clicked.connect(self.export_profile_results)
+        self.profile_stop_button.clicked.connect(self.stop_profile_collect)
+        self.profile_start_button.clicked.connect(self.start_profile_collect)
+
+        buttons.addWidget(self.profile_paste_button)
+        buttons.addWidget(self.profile_clear_button)
+        buttons.addStretch()
+        buttons.addWidget(self.profile_open_dir_button)
+        buttons.addWidget(self.profile_export_button)
+        buttons.addWidget(self.profile_stop_button)
+        buttons.addWidget(self.profile_start_button)
+
+        input_layout.addLayout(buttons)
+
+        # ====================================================
+        # PROGRESS PROFILE
+        # ====================================================
+
+        progress_row = QHBoxLayout()
+
+        self.profile_progress_bar = QProgressBar()
+        self.profile_progress_bar.setRange(0, 100)
+        self.profile_progress_bar.setValue(0)
+        self.profile_progress_bar.setTextVisible(True)
+
+        self.profile_progress_text = QLabel("Sẵn sàng")
+        self.profile_progress_text.setMinimumWidth(240)
+
+        progress_row.addWidget(self.profile_progress_bar, 1)
+        progress_row.addWidget(self.profile_progress_text)
+
+        input_layout.addLayout(progress_row)
+
+        splitter.addWidget(input_frame)
+
+        # ====================================================
+        # TABLE PROFILE
+        # ====================================================
+
+        table_frame = QFrame()
+        table_frame.setObjectName("panel")
+
+        table_layout = QVBoxLayout(table_frame)
+        table_layout.setContentsMargins(10, 10, 10, 10)
+
+        table_title = QLabel("Kết quả thông tin kênh")
+        table_title.setObjectName("sectionTitle")
+        table_layout.addWidget(table_title)
+
+        self.profile_table = QTableWidget()
+        self.profile_table.setColumnCount(14)
+        self.profile_table.setHorizontalHeaderLabels([
+            "STT",
+            "Username",
+            "Tên kênh",
+            "ID kênh",
+            "Follower",
+            "Following",
+            "Likes",
+            "Videos",
+            "Verified",
+            "Bio",
+            "Link kênh",
+            "Trạng thái",
+            "Phương thức lấy dữ liệu",
+            "Thời gian lấy",
+        ])
+
+        self.profile_table.setAlternatingRowColors(True)
+        self.profile_table.verticalHeader().setVisible(False)
+        self.profile_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.profile_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.profile_table.horizontalHeader().setStretchLastSection(True)
+
+        profile_widths = [
+            50,   # STT
+            130,  # Username
+            150,  # Tên kênh
+            160,  # ID kênh
+            100,  # Follower
+            90,   # Following
+            100,  # Likes
+            80,   # Videos
+            80,   # Verified
+            230,  # Bio
+            180,  # Link kênh
+            140,  # Trạng thái
+            140,  # Phương thức
+            140,  # Thời gian lấy
+        ]
+
+        for index, width in enumerate(profile_widths):
+            self.profile_table.setColumnWidth(index, width)
+
+        table_layout.addWidget(self.profile_table)
+        splitter.addWidget(table_frame)
+
+        splitter.setSizes([260, 580])
+        layout.addWidget(splitter, 1)
+
+        return tab_widget
+
 
     # ========================================================
     # STYLE
@@ -1403,6 +1781,56 @@ class MainWindow(
                 background: #07989a;
             }
 
+            QPushButton#stopButton {
+                min-height: 38px;
+                padding: 0 18px;
+                color: white;
+                border: none;
+                background: #ef4444;
+                font-weight: 700;
+                border-radius: 7px;
+            }
+
+            QPushButton#stopButton:hover {
+                background: #dc2626;
+            }
+
+            QPushButton#stopButton:disabled {
+                background: #fca5a5;
+                color: #fef2f2;
+            }
+
+            QTabWidget::pane {
+                border: 1px solid #e5e7eb;
+                background: #f5f7f8;
+                border-radius: 8px;
+                top: -1px;
+            }
+
+            QTabBar::tab {
+                background: #e5e7eb;
+                color: #4b5563;
+                font-size: 13px;
+                font-weight: 700;
+                padding: 10px 24px;
+                margin-right: 6px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                border: 1px solid #d1d5db;
+                border-bottom: none;
+            }
+
+            QTabBar::tab:selected {
+                background: #03B0B1;
+                color: #ffffff;
+                border-color: #03B0B1;
+            }
+
+            QTabBar::tab:hover:!selected {
+                background: #dbeafe;
+                color: #1e3a8a;
+            }
+
             QProgressBar {
                 min-height: 19px;
                 border: none;
@@ -1410,6 +1838,7 @@ class MainWindow(
                 background: #e5e7eb;
                 text-align: center;
             }
+
 
             QProgressBar::chunk {
                 border-radius: 7px;
@@ -1950,7 +2379,13 @@ class MainWindow(
     def start_collect(
         self,
     ):
-        if self.is_running:
+        if self.is_running or self.is_profile_running:
+            if self.is_profile_running:
+                self.show_light_dialog(
+                    "Đang quét thông tin kênh",
+                    "Tiến trình quét thông tin kênh đang chạy. Vui lòng đợi hoặc dừng tiến trình trước khi phân tích video.",
+                    is_error=False,
+                )
             return
 
         if (
@@ -2644,6 +3079,390 @@ class MainWindow(
             )
 
     # ========================================================
+    # PROFILE TAB METHODS
+    # ========================================================
+
+    def get_raw_profile_inputs(
+        self,
+    ) -> list[str]:
+        text = (
+            self.profile_url_input
+            .toPlainText()
+        )
+        return [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+
+    def update_profile_input_counter(
+        self,
+    ):
+        raw_lines = self.get_raw_profile_inputs()
+        if not raw_lines:
+            self.profile_input_info.setText("0 kênh")
+            self.profile_card_input.set_value("0")
+            return
+
+        unique_items, duplicates = deduplicate_channel_inputs(raw_lines)
+        valid_count = sum(1 for ch in unique_items if ch.valid)
+
+        self.profile_input_info.setText(
+            f"{len(raw_lines)} mục • {valid_count} hợp lệ • {len(unique_items)} duy nhất • {len(duplicates)} trùng"
+        )
+        self.profile_card_input.set_value(len(unique_items))
+
+    def paste_profile_clipboard(
+        self,
+    ):
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        if text:
+            current = self.profile_url_input.toPlainText().strip()
+            if current:
+                self.profile_url_input.appendPlainText(text)
+            else:
+                self.profile_url_input.setPlainText(text)
+
+    def clear_profile_inputs(
+        self,
+    ):
+        if self.is_profile_running:
+            return
+
+        self.profile_url_input.clear()
+        self.profile_table.setRowCount(0)
+        self.profile_row_by_key.clear()
+        self.profile_latest_status.clear()
+        self.profile_finalized_keys.clear()
+        self.profile_last_results = []
+        self.profile_progress_bar.setValue(0)
+        self.profile_progress_text.setText("Sẵn sàng")
+
+        self.profile_card_processed.set_value(0)
+        self.profile_card_success.set_value(0)
+        self.profile_card_other.set_value(0)
+        self.profile_export_button.setEnabled(False)
+
+    def prepare_profile_table(
+        self,
+        channels: list[TikTokChannelInput],
+    ):
+        self.profile_table.setRowCount(len(channels))
+        self.profile_row_by_key = {}
+        self.profile_latest_status = {}
+        self.profile_finalized_keys = set()
+
+        for index, ch in enumerate(channels):
+            if ch.username:
+                self.profile_row_by_key[ch.username.lower()] = index
+            self.profile_row_by_key[ch.raw_input] = index
+            if ch.normalized_url:
+                self.profile_row_by_key[ch.normalized_url] = index
+
+            initial_status = "Chờ xử lý" if ch.valid else "Link không hợp lệ"
+            values = [
+                str(index + 1),
+                ch.username or "",
+                "",
+                "",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "",
+                ch.normalized_url or ch.raw_input,
+                initial_status,
+                "-",
+                "-",
+            ]
+
+            for col, val in enumerate(values):
+                item = QTableWidgetItem(str(val))
+                if col in {0, 4, 5, 6, 7, 8, 11, 12, 13}:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.profile_table.setItem(index, col, item)
+
+    def start_profile_collect(
+        self,
+    ):
+        if self.is_profile_running or self.is_running:
+            if self.is_running:
+                self.show_light_dialog(
+                    "Đang phân tích video",
+                    "Tiến trình phân tích video đang chạy. Vui lòng đợi hoặc dừng tiến trình trước khi quét thông tin kênh.",
+                    is_error=False,
+                )
+            return
+
+        raw_lines = self.get_raw_profile_inputs()
+        if not raw_lines:
+            self.show_light_dialog(
+                "Chưa có đầu vào",
+                "Hãy nhập hoặc dán danh sách URL kênh, @username hoặc URL video.",
+                is_error=False,
+            )
+            return
+
+        unique_channels, duplicates = deduplicate_channel_inputs(raw_lines)
+        if not unique_channels:
+            self.show_light_dialog(
+                "Không có kênh",
+                "Không có kênh nào để xử lý.",
+                is_error=False,
+            )
+            return
+
+        self.profile_original_count = len(raw_lines)
+        self.profile_unique_items = unique_channels
+        self.profile_duplicate_urls = duplicates
+        self.profile_last_results = []
+        self.profile_last_elapsed = 0
+
+        self.prepare_profile_table(unique_channels)
+
+        self.is_profile_running = True
+        self.profile_start_button.setEnabled(False)
+        self.profile_stop_button.setEnabled(True)
+        self.profile_paste_button.setEnabled(False)
+        self.profile_clear_button.setEnabled(False)
+        self.profile_export_button.setEnabled(False)
+        self.profile_url_input.setReadOnly(True)
+
+        self.profile_progress_bar.setRange(0, len(unique_channels))
+        self.profile_progress_bar.setValue(0)
+        self.profile_progress_text.setText(f"Đang xử lý 0/{len(unique_channels)}")
+
+        self.profile_card_processed.set_value(0)
+        self.profile_card_success.set_value(0)
+        self.profile_card_other.set_value(0)
+
+        # Worker & Thread
+        self.profile_thread = QThread()
+        self.profile_worker = ProfileCollectorWorker(unique_channels)
+        self.profile_worker.moveToThread(self.profile_thread)
+
+        self.profile_thread.started.connect(self.profile_worker.run)
+        self.profile_worker.result_ready.connect(self.on_profile_result)
+        self.profile_worker.finished.connect(self.on_profile_finished)
+        self.profile_worker.failed.connect(self.on_profile_failed)
+
+        self.profile_worker.finished.connect(self.profile_thread.quit)
+        self.profile_worker.failed.connect(self.profile_thread.quit)
+        self.profile_worker.finished.connect(self.profile_worker.deleteLater)
+        self.profile_worker.failed.connect(self.profile_worker.deleteLater)
+        self.profile_thread.finished.connect(self.profile_thread.deleteLater)
+
+        self.profile_thread.start()
+
+    def stop_profile_collect(
+        self,
+    ):
+        if not self.is_profile_running:
+            return
+        if self.profile_worker is not None:
+            self.profile_worker.cancel()
+        self.profile_stop_button.setEnabled(False)
+        self.profile_progress_text.setText("Đang dừng...")
+
+    @Slot(object, bool)
+    def on_profile_result(
+        self,
+        result_dict,
+        retry_mode,
+    ):
+        raw_input = result_dict.get("input_url") or ""
+        username = (result_dict.get("username") or "").lower()
+
+        row = self.profile_row_by_key.get(username)
+        if row is None:
+            row = self.profile_row_by_key.get(raw_input)
+        if row is None:
+            row = self.profile_row_by_key.get(result_dict.get("profile_url"))
+        if row is None:
+            return
+
+        status = result_dict.get("status") or ""
+        key = username or raw_input
+        self.profile_latest_status[key] = status
+
+        verified_val = result_dict.get("verified")
+        verified_str = "Có" if verified_val is True else ("Không" if verified_val is False else "-")
+
+        bio_clean = (result_dict.get("bio") or "").replace("\n", " ")
+
+        values = {
+            1: result_dict.get("username") or "",
+            2: result_dict.get("nickname") or "",
+            3: str(result_dict.get("user_id") or ""),
+            4: format_number(result_dict.get("follower_count")),
+            5: format_number(result_dict.get("following_count")),
+            6: format_number(result_dict.get("likes_count")),
+            7: format_number(result_dict.get("video_count")),
+            8: verified_str,
+            9: bio_clean,
+            10: result_dict.get("profile_url") or "",
+            11: format_profile_status(status),
+            12: result_dict.get("source_method") or "",
+            13: result_dict.get("collected_at") or "",
+        }
+
+        if not retry_mode and status in PROFILE_RETRYABLE_STATUSES:
+            values[11] = format_profile_status(status) + " • chờ thử lại"
+
+        for col, val in values.items():
+            item = QTableWidgetItem(str(val))
+            if col in {4, 5, 6, 7, 8, 11, 12, 13}:
+                item.setTextAlignment(Qt.AlignCenter)
+            self.profile_table.setItem(row, col, item)
+
+        status_item = self.profile_table.item(row, 11)
+        if status_item:
+            if status == "SUCCESS":
+                status_item.setBackground(QBrush(QColor("#DCFCE7")))
+            elif status in {"PARTIAL", "PRIVATE"}:
+                status_item.setBackground(QBrush(QColor("#FEF3C7")))
+            elif status in {
+                "NOT_FOUND",
+                "CAPTCHA_REQUIRED",
+                "RATE_LIMITED",
+                "SESSION_EXPIRED",
+                "TIMEOUT",
+                "NETWORK_ERROR",
+                "PARSE_ERROR",
+                "LINK_TIKTOK_KHONG_HOP_LE",
+                "KHONG_HO_TRO_NEN_TANG",
+            }:
+                status_item.setBackground(QBrush(QColor("#FEE2E2")))
+            else:
+                status_item.setBackground(QBrush(QColor("#F3F4F6")))
+
+        if retry_mode or status not in PROFILE_RETRYABLE_STATUSES:
+            self.profile_finalized_keys.add(key)
+
+        self.refresh_profile_progress()
+
+    def refresh_profile_progress(
+        self,
+    ):
+        processed = len(self.profile_finalized_keys)
+        total = len(self.profile_unique_items)
+
+        success = 0
+        other = 0
+        for key in self.profile_finalized_keys:
+            st = self.profile_latest_status.get(key, "")
+            if st == "SUCCESS":
+                success += 1
+            else:
+                other += 1
+
+        self.profile_progress_bar.setValue(processed)
+        self.profile_progress_text.setText(f"Đã xử lý {processed}/{total}")
+        self.profile_card_processed.set_value(processed)
+        self.profile_card_success.set_value(success)
+        self.profile_card_other.set_value(other)
+
+    @Slot(object)
+    def on_profile_finished(
+        self,
+        payload,
+    ):
+        self.profile_last_results = payload.get("results", [])
+        self.profile_last_elapsed = payload.get("elapsed", 0)
+
+        for ch in self.profile_unique_items:
+            k = (ch.username.lower() if ch.username else ch.raw_input)
+            self.profile_finalized_keys.add(k)
+
+        for res in self.profile_last_results:
+            k = (res.username.lower() if res.username else res.input_url)
+            self.profile_latest_status[k] = res.status
+
+        self.refresh_profile_progress()
+        self.profile_progress_text.setText(
+            f"Hoàn tất {len(self.profile_unique_items)} kênh • {self.profile_last_elapsed:.1f} giây"
+        )
+
+        has_expired = any(r.status == "SESSION_EXPIRED" for r in self.profile_last_results)
+        if has_expired:
+            delete_session()
+            self.apply_session_status(SESSION_EXPIRED, "TikTok đã yêu cầu đăng nhập lại.")
+            self.finish_profile_run_state()
+            dialog = ExportResultDialog(
+                parent=self,
+                title="TikTok Session đã hết hạn",
+                message=(
+                    "TikTok đã yêu cầu đăng nhập lại. "
+                    "Hãy bấm 'Đăng nhập lại' ở góc trên bên phải, sau đó quét lại danh sách kênh."
+                ),
+                file_path=None,
+                is_error=True,
+            )
+            dialog.exec()
+            return
+
+        self.profile_export_button.setEnabled(True)
+        self.finish_profile_run_state()
+
+    @Slot(str)
+    def on_profile_failed(
+        self,
+        error,
+    ):
+        self.finish_profile_run_state()
+        self.profile_progress_text.setText("Đã xảy ra lỗi")
+        self.show_light_dialog(
+            "Lỗi Profile Collector",
+            error,
+            is_error=True,
+        )
+
+    def finish_profile_run_state(
+        self,
+    ):
+        self.is_profile_running = False
+        self.profile_start_button.setEnabled(True)
+        self.profile_stop_button.setEnabled(False)
+        self.profile_paste_button.setEnabled(True)
+        self.profile_clear_button.setEnabled(True)
+        self.profile_url_input.setReadOnly(False)
+
+    def export_profile_results(
+        self,
+    ):
+        if not self.profile_last_results:
+            self.show_export_error_dialog(
+                "Chưa có dữ liệu",
+                "Chưa có kết quả để xuất Excel.",
+            )
+            return
+
+        try:
+            output_file = export_profile_excel(
+                results=self.profile_last_results,
+                duplicate_count=len(self.profile_duplicate_urls),
+                original_count=self.profile_original_count,
+                elapsed=self.profile_last_elapsed,
+            )
+            self.show_export_success_dialog(output_file)
+        except Exception as exc:
+            self.show_export_error_dialog(
+                "Không xuất được Excel",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def open_export_dir_clicked(
+        self,
+    ):
+        try:
+            export_dir = get_export_dir()
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(export_dir)))
+        except Exception as exc:
+            self.show_light_dialog("Lỗi", f"Không thể mở thư mục: {exc}", is_error=True)
+
+    # ========================================================
     # CLOSE
     # ========================================================
 
@@ -2651,22 +3470,20 @@ class MainWindow(
         self,
         event,
     ):
-        if self.is_running:
-
+        if self.is_running or self.is_profile_running:
             self.show_light_dialog(
                 "Tool đang chạy",
                 (
-                    "Collector đang lấy dữ liệu.\n"
-                    "Hãy chờ xử lý xong rồi đóng ứng dụng."
+                    "Một tác vụ đang lấy dữ liệu.\n"
+                    "Hãy chờ xử lý xong hoặc bấm Dừng trước khi đóng ứng dụng."
                 ),
                 is_error=False,
             )
-
             event.ignore()
-
             return
 
         event.accept()
+
 
 
 # ============================================================
@@ -2674,6 +3491,22 @@ class MainWindow(
 # ============================================================
 
 def main():
+    if "--smoke-test" in sys.argv:
+        import os
+        print("SMOKE TEST OK: App initialized successfully.")
+        print("PLAYWRIGHT_BROWSERS_PATH:", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
+        sys.exit(0)
+
+    if "--test-playwright" in sys.argv:
+        import os
+        print("TEST PLAYWRIGHT: Verifying bundled browser launch...")
+        print("PLAYWRIGHT_BROWSERS_PATH:", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            print("PLAYWRIGHT BROWSER OK: Version", b.version)
+            b.close()
+        sys.exit(0)
 
     app = QApplication(
         sys.argv

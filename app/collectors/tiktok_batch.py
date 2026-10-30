@@ -973,14 +973,23 @@ class TikTokBatchCollector:
             return results
 
         async with async_playwright() as p:
-            browser = (
-                await p.chromium.launch(
-                    channel="chrome",
-                    headless=(
-                        self.headless
-                    ),
+            try:
+                browser = (
+                    await p.chromium.launch(
+                        channel="chrome",
+                        headless=(
+                            self.headless
+                        ),
+                    )
                 )
-            )
+            except Exception:
+                browser = (
+                    await p.chromium.launch(
+                        headless=(
+                            self.headless
+                        ),
+                    )
+                )
 
             # =================================================
             # PASS 1 - FAST
@@ -1155,14 +1164,23 @@ class TikTokBatchCollector:
                     in rescue_indexes
                 ]
 
-                rescue_browser = (
-                    await p.chromium.launch(
-                        channel="chrome",
-                        headless=(
-                            self.headless
-                        ),
+                try:
+                    rescue_browser = (
+                        await p.chromium.launch(
+                            channel="chrome",
+                            headless=(
+                                self.headless
+                            ),
+                        )
                     )
-                )
+                except Exception:
+                    rescue_browser = (
+                        await p.chromium.launch(
+                            headless=(
+                                self.headless
+                            ),
+                        )
+                    )
 
                 try:
                     rescue_context = (

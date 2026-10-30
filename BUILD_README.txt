@@ -1,44 +1,32 @@
-TIKTOK VIDEO PERFORMANCE - BUILD MACOS DEV APP
+TIKTOK VIDEO PERFORMANCE - BUILD MACOS STANDALONE APP (APPLE SILICON ARM64)
 
-1. Dat 2 file/folder sau vao project crawl-data:
-   TikTokVideoPerformance.spec
-   build/build_mac.sh
+1. CÁCH BUILD:
+   cd /duong-dan-toi/crawl-data
+   bash build_macos.sh
+   (hoặc: bash build/build_mac.sh)
 
-2. Cau truc can co:
-   crawl-data/
-     gui_app.py
-     run_batch.py
-     TikTokVideoPerformance.spec
-     app/
-       __init__.py
-       session_manager.py
-       tiktok_login.py
-       collectors/
-         __init__.py
-         tiktok_batch.py
-         tiktok_browser.py
-         tiktok_http.py
-       utils/
-         __init__.py
-         url_parser.py
-     build/
-       build_mac.sh
+2. KẾT QUẢ ĐÓNG GÓI:
+   - Ứng dụng .app: dist/TikTok Video Performance.app
+   - File ZIP phân phối: dist/TikTokVideoPerformance-macOS-arm64.zip
 
-3. Terminal:
-   cd duong-dan-toi/crawl-data
-   source .venv/bin/activate
-   python -m pip install -U pyinstaller
-   bash build/build_mac.sh
+3. ĐẶC ĐIỂM BẢN BUILD ĐỘC LẬP (STANDALONE):
+   - Đã nhúng sẵn Chromium Playwright vào Contents/Resources/ms-playwright.
+   - Người nhận KHÔNG cần cài Python, PySide6 hay Playwright.
+   - Nếu máy người nhận chưa có Google Chrome, hệ thống tự động chạy Chromium đóng gói sẵn.
+   - App tự động cấu hình PLAYWRIGHT_BROWSERS_PATH khi khởi chạy.
+   - Ứng dụng được ad-hoc sign sâu (--deep) và xác minh tính toàn vẹn (codesign --verify).
 
-4. App tao tai:
-   dist/TikTok Video Performance.app
+4. LƯU Ý VỀ DỮ LIỆU & BẢO MẬT:
+   - File ZIP không chứa cookie hay session cá nhân.
+   - Session/cookie của người dùng được lưu tại:
+     ~/Library/Application Support/TikTok Video Performance/tiktok_state.json
+   - File Excel kết quả được xuất ra:
+     ~/Documents/TikTok Video Performance/Exports/
 
-5. Test:
-   open "dist/TikTok Video Performance.app"
-
-LUU Y:
-- Day la ban build dev chua ky/notarize.
-- Collector hien dung Google Chrome (channel="chrome"), vi vay may test phai co Google Chrome.
-- Session cua tung nguoi van nam ngoai app trong ~/Library/Application Support/TikTok Video Performance/.
-- Excel van xuat ra Documents/TikTok Video Performance/Exports/.
-- Khong copy tiktok_state.json vao goi app.
+5. KIỂM THỬ:
+   - Mở ứng dụng bình thường:
+     open "dist/TikTok Video Performance.app"
+   - Smoke test kiểm tra runtime:
+     "dist/TikTok Video Performance.app/Contents/MacOS/TikTok Video Performance" --smoke-test
+   - Test khởi động Playwright từ bản đóng gói:
+     "dist/TikTok Video Performance.app/Contents/MacOS/TikTok Video Performance" --test-playwright

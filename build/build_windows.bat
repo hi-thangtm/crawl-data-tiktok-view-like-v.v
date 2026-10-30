@@ -19,6 +19,9 @@ python -m py_compile run_batch.py || goto :error
 python -m py_compile app\session_manager.py || goto :error
 python -m py_compile app\tiktok_login.py || goto :error
 python -m py_compile app\collectors\tiktok_batch.py || goto :error
+python -m py_compile app\collectors\tiktok_profile_batch.py || goto :error
+python -m py_compile app\collectors\tiktok_profile_http.py || goto :error
+python -m py_compile app\utils\profile_excel.py || goto :error
 
 echo [4/5] Building...
 python -m PyInstaller --clean --noconfirm TikTokVideoPerformance.windows.spec || goto :error
